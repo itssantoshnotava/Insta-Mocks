@@ -7,6 +7,12 @@ const app = initializeApp(firebaseConfig);
 export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId); /* CRITICAL: The app will break without this line */
 export const auth = getAuth(app);
 export const googleProvider = new GoogleAuthProvider();
+googleProvider.addScope("https://www.googleapis.com/auth/drive.file");
+googleProvider.addScope("https://www.googleapis.com/auth/drive.readonly");
+googleProvider.setCustomParameters({
+  client_id: "334580798450-s1bfere8ecfqt41ikflsrkpetu2tvtoj.apps.googleusercontent.com",
+  prompt: "select_account"
+});
 
 export enum OperationType {
   CREATE = "create",

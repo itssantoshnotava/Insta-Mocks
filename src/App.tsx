@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from "react";
-import { onAuthStateChanged, signInWithPopup, signOut, User } from "firebase/auth";
+import { onAuthStateChanged, signInWithPopup, signOut, User, GoogleAuthProvider } from "firebase/auth";
 import { collection, query, where, orderBy, getDocs, doc, setDoc, deleteDoc, Timestamp, serverTimestamp } from "firebase/firestore";
 import { auth, db, googleProvider, handleFirestoreError, OperationType } from "./lib/firebase";
 import { Quiz, Performance, Question } from "./types";
@@ -21,7 +21,12 @@ import {
   X, 
   AlertTriangle,
   Key,
-  Settings
+  Settings,
+  RefreshCw,
+  Search,
+  FolderOpen,
+  Cloud,
+  HardDrive
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { GoogleGenAI, Type } from "@google/genai";
@@ -84,6 +89,13 @@ export default function App() {
   const [userGeminiKey, setUserGeminiKey] = useState<string>(() => localStorage.getItem("user_gemini_key") || "");
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [showKeyWarning, setShowKeyWarning] = useState(false);
+  
+  // Google Drive integration states
+  const [driveToken, setDriveToken] = useState<string>(() => localStorage.getItem("drive_wristband") || "");
+  const [driveFiles, setDriveFiles] = useState<any[]>([]);
+  const [driveSearch, setDriveSearch] = useState<string>("");
+  const [isFetchingDrive, setIsFetchingDrive] = useState<boolean>(false);
+  const [activeTab, setActiveTab] = useState<"upload" | "drive">("upload");
 
   // Dynamic lists from Firestore
   const [quizzes, setQuizzes] = useState<Quiz[]>([COMPREHENSIVE_DEMO_QUIZ]);
@@ -101,6 +113,136 @@ export default function App() {
   // File reference
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  // Google Drive listing and directory sync methods
+  const fetchDriveFiles = async (token: string) => {
+    if (!token) return;
+    setIsFetchingDrive(true);
+    try {
+      const url = "https://www.googleapis.com/drive/v3/files?q=mimeType%3D%27application%2Fpdf%27+and+trashed%3Dfalse&fields=files%28id%2Cname%2CmimeType%2Csize%2CcreatedTime%29&pageSize=40&orderBy=createdTime+desc";
+      const res = await fetch(url, {
+        headers: {
+          Authorization: `Bearer ${token}`
+        }
+      });
+      if (res.status === 401) {
+        handleDriveTokenExpiry();
+        return;
+      }
+      if (!res.ok) {
+        throw new Error("Unable to fetch documents from Google Drive.");
+      }
+      const data = await res.json();
+      setDriveFiles(data.files || []);
+    } catch (err: any) {
+      console.error("Drive Fetch Error:", err);
+      setErrorAlert("Failed to load Google Drive files. Click 'Connect Google Drive' to refresh access.");
+    } finally {
+      setIsFetchingDrive(false);
+    }
+  };
+
+  const handleDriveTokenExpiry = () => {
+    localStorage.removeItem("drive_wristband");
+    setDriveToken("");
+    setDriveFiles([]);
+    setErrorAlert("Your Google Drive validation expired or was revoked. Please reconnect to restore cloud operations.");
+  };
+
+  const fetchFolderId = async (token: string): Promise<string> => {
+    const safeSearchUrl = `https://www.googleapis.com/drive/v3/files?q=mimeType='application/vnd.google-apps.folder'+and+name='InstaMocks_PYQs'+and+trashed=false&fields=files(id)&pageSize=1`;
+    const res = await fetch(safeSearchUrl, {
+      headers: { Authorization: `Bearer ${token}` }
+    });
+    if (res.status === 401) {
+      handleDriveTokenExpiry();
+      throw new Error("Google Drive Token Expired");
+    }
+    if (!res.ok) {
+      throw new Error("Failed to search folder structure in Google Drive.");
+    }
+    const data = await res.json();
+    if (data.files && data.files.length > 0) {
+      return data.files[0].id;
+    }
+    
+    // Create Folder
+    const createUrl = "https://www.googleapis.com/drive/v3/files";
+    const createRes = await fetch(createUrl, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        name: "InstaMocks_PYQs",
+        mimeType: "application/vnd.google-apps.folder"
+      })
+    });
+    if (!createRes.ok) {
+      throw new Error("Unable to create base folder 'InstaMocks_PYQs' in Google Drive.");
+    }
+    const folderData = await createRes.json();
+    return folderData.id;
+  };
+
+  const uploadFileToFolder = async (token: string, file: File, folderId: string) => {
+    const metadata = {
+      name: file.name,
+      parents: [folderId]
+    };
+    const boundary = "multipart_boundary_drive_upload";
+    const delimiter = `\r\n--${boundary}\r\n`;
+    const close_delim = `\r\n--${boundary}--`;
+
+    const fileBuffer = await new Promise<ArrayBuffer>((resolve, reject) => {
+      const r = new FileReader();
+      r.onload = () => resolve(r.result as ArrayBuffer);
+      r.onerror = () => reject(r.error);
+      r.readAsArrayBuffer(file);
+    });
+
+    const metadataPart = 'Content-Type: application/json; charset=UTF-8\r\n\r\n' + JSON.stringify(metadata) + '\r\n';
+    const fileHeader = `Content-Type: ${file.type || 'application/pdf'}\r\n\r\n`;
+    
+    const multipartBody = new Blob([
+      delimiter,
+      metadataPart,
+      delimiter,
+      fileHeader,
+      new Uint8Array(fileBuffer),
+      close_delim
+    ], { type: `multipart/related; boundary=${boundary}` });
+
+    const response = await fetch("https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": `multipart/related; boundary=${boundary}`
+      },
+      body: multipartBody
+    });
+
+    if (!response.ok) {
+      throw new Error("Google Drive upload request failed.");
+    }
+    return await response.json();
+  };
+
+  const autoSaveToDrive = async (file: File) => {
+    const token = localStorage.getItem("drive_wristband") || driveToken;
+    if (!token) {
+      console.log("Drive background auto-save matches skipped: no token stored.");
+      return;
+    }
+    try {
+      const folderId = await fetchFolderId(token);
+      await uploadFileToFolder(token, file, folderId);
+      console.log("File auto-saved to Google Drive folder 'InstaMocks_PYQs' successfully.");
+    } catch (err) {
+      console.error("Auto-Save to Google Drive Error:", err);
+    }
+  };
+
   // Auth observer initialization
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, (loggedUser) => {
@@ -108,10 +250,16 @@ export default function App() {
       setAuthLoading(false);
       if (loggedUser) {
         fetchUserData(loggedUser.uid);
+        const storedToken = localStorage.getItem("drive_wristband");
+        if (storedToken) {
+          setDriveToken(storedToken);
+          fetchDriveFiles(storedToken);
+        }
       } else {
-        // Fall back to just the preloaded demo quiz for safe clean view
         setQuizzes([COMPREHENSIVE_DEMO_QUIZ]);
         setPerformances([]);
+        setDriveToken("");
+        setDriveFiles([]);
       }
     });
     return () => unsubscribe();
@@ -168,10 +316,17 @@ export default function App() {
     }
   };
 
-  // Google Single Sign-In popup with security exception catch
+  // Google Single Sign-In popup with security exception catch and Drive Token interception
   const handleSignIn = async () => {
     try {
-      await signInWithPopup(auth, googleProvider);
+      const result = await signInWithPopup(auth, googleProvider);
+      const credential = GoogleAuthProvider.credentialFromResult(result);
+      const token = credential?.accessToken;
+      if (token) {
+        localStorage.setItem("drive_wristband", token);
+        setDriveToken(token);
+        fetchDriveFiles(token);
+      }
       setErrorAlert(null);
     } catch (err: any) {
       console.error("Login Error:", err);
@@ -183,10 +338,54 @@ export default function App() {
   const handleSignOut = async () => {
     try {
       await signOut(auth);
+      localStorage.removeItem("drive_wristband");
+      setDriveToken("");
+      setDriveFiles([]);
       setView("hub");
       setActiveQuiz(null);
     } catch (err: any) {
       console.error("Sign Out Error:", err);
+    }
+  };
+
+  // Fetch file media from drive or parse it directly
+  const fetchFileBlobFromDrive = async (token: string, fileId: string): Promise<Blob> => {
+    const url = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`;
+    const res = await fetch(url, {
+      headers: {
+        Authorization: `Bearer ${token}`
+      }
+    });
+    if (!res.ok) {
+      if (res.status === 401) {
+        handleDriveTokenExpiry();
+      }
+      throw new Error("Failed to fetch PDF bytes from Google Drive.");
+    }
+    return await res.blob();
+  };
+
+  const processDriveFile = async (driveFileId: string, fileName: string) => {
+    try {
+      setErrorAlert(null);
+      setIsUploading(true);
+      setUploadProgressText("Connecting to Google Drive to download PDF...");
+
+      const token = localStorage.getItem("drive_wristband") || driveToken;
+      if (!token) {
+        throw new Error("Missing active Google Drive authorization token.");
+      }
+
+      const blob = await fetchFileBlobFromDrive(token, driveFileId);
+      const mockFile = new File([blob], fileName, { type: "application/pdf" });
+      
+      // Pass copy processing without uploading back again to avoid duplicates
+      await processFile(mockFile, { skipDriveUpload: true });
+
+    } catch (err: any) {
+      console.error("Google Drive Import Error:", err);
+      setErrorAlert(err.message || "An error occurred while importing file from Google Drive.");
+      setIsUploading(false);
     }
   };
 
@@ -218,7 +417,7 @@ export default function App() {
   };
 
   // File Upload, Read As Data URL, and client-side AI processing pipeline
-  const processFile = async (file: File) => {
+  const processFile = async (file: File, options?: { skipDriveUpload?: boolean }) => {
     // Validate only PDFs
     if (file.type !== "application/pdf" && !file.name.endsWith(".pdf")) {
       setErrorAlert("Invalid file format. Please upload standard .pdf files only.");
@@ -361,6 +560,13 @@ Write a supportive, elaborate, and pedagogical explanation for each answer.`;
 
       // Re-query database to show new list
       await fetchUserData(user.uid);
+      
+      // Auto-save backup copy to Google Drive 'InstaMocks_PYQs' in background
+      if (!options?.skipDriveUpload && driveToken) {
+        setUploadProgressText("Auto-saving source PDF directly to secure InstaMocks_PYQs folder...");
+        await autoSaveToDrive(file);
+      }
+      
       setUploadProgressText("Quiz successfully created!");
 
     } catch (err: any) {
@@ -453,6 +659,10 @@ Write a supportive, elaborate, and pedagogical explanation for each answer.`;
       }
     }
   };
+
+  const filteredDriveFiles = driveFiles.filter(file =>
+    file.name.toLowerCase().includes(driveSearch.toLowerCase())
+  );
 
   return (
     <div className="min-h-screen bg-[#050505] text-[#e0e0e0] flex flex-col font-sans selection:bg-[#F27D26]/35 selection:text-white" id="main-app">
@@ -549,83 +759,254 @@ Write a supportive, elaborate, and pedagogical explanation for each answer.`;
                   <div className="absolute top-0 right-0 w-80 h-80 rounded-full bg-[#F27D26]/5 blur-[120px] pointer-events-none" />
                   <div className="absolute bottom-0 left-10 w-60 h-60 rounded-full bg-[#F27D26]/5 blur-[100px] pointer-events-none" />
 
-                  <div className="grid grid-cols-1 lg:grid-cols-5 gap-8 items-center relative z-10">
-                    
-                    {/* Instructions and Description */}
-                    <div className="lg:col-span-3">
-                      <div className="inline-flex items-center gap-1.5 px-3 py-1 bg-[#F27D26]/10 text-[#F27D26] rounded-full text-xs font-mono uppercase mb-4 border border-[#F27D26]/20">
-                        <Sparkles className="w-3.5 h-3.5" />
-                        <span>Powered by gemini-2.5-flash</span>
-                      </div>
-                      <h2 className="text-2xl md:text-4xl font-serif italic text-white tracking-tight mb-4">
-                        Convert PYQ PDFs into interactive Mock Exams
-                      </h2>
-                      <p className="text-white/60 text-sm md:text-base leading-relaxed font-light mb-6">
-                        Upload your previous exam question papers, tests, or worksheets. Our AI parses and models complex multiple choice segments, delivering immediate feedback practice grids or strict timed test stimulators.
-                      </p>
+                  {/* Tab Selector */}
+                  <div className="flex border-b border-white/5 mb-8 relative z-10" id="portal-tab-selector">
+                    <button
+                      onClick={() => setActiveTab("upload")}
+                      className={`pb-3 text-xs uppercase font-mono font-bold tracking-wider relative transition-colors cursor-pointer mr-6 ${
+                        activeTab === "upload" ? "text-[#F27D26]" : "text-white/40 hover:text-white/70"
+                      }`}
+                    >
+                      Local File Sync
+                      {activeTab === "upload" && (
+                        <motion.div layoutId="activeTabLine" className="absolute bottom-0 left-0 right-0 h-0.5 bg-[#F27D26]" />
+                      )}
+                    </button>
+                    <button
+                      onClick={() => {
+                        setActiveTab("drive");
+                        if (driveToken) {
+                          fetchDriveFiles(driveToken);
+                        }
+                      }}
+                      className={`pb-3 text-xs uppercase font-mono font-bold tracking-wider relative transition-colors cursor-pointer flex items-center gap-1.5 ${
+                        activeTab === "drive" ? "text-[#F27D26]" : "text-white/40 hover:text-white/70"
+                      }`}
+                    >
+                      Google Drive Library
+                      {activeTab === "drive" && (
+                        <motion.div layoutId="activeTabLine" className="absolute bottom-0 left-0 right-0 h-0.5 bg-[#F27D26]" />
+                      )}
+                    </button>
+                  </div>
 
-                      <div className="flex gap-6">
-                        <div className="flex items-center gap-2">
-                          <CheckCircle className="w-4 h-4 text-[#F27D26]" />
-                          <span className="text-xs text-white/40 font-mono tracking-wider">100% SECURE TUNNEL</span>
+                  {activeTab === "upload" ? (
+                    <div className="grid grid-cols-1 lg:grid-cols-5 gap-8 items-center relative z-10">
+                      
+                      {/* Instructions and Description */}
+                      <div className="lg:col-span-3">
+                        <div className="inline-flex items-center gap-1.5 px-3 py-1 bg-[#F27D26]/10 text-[#F27D26] rounded-full text-xs font-mono uppercase mb-4 border border-[#F27D26]/20">
+                          <Sparkles className="w-3.5 h-3.5" />
+                          <span>Powered by gemini-2.5-flash</span>
                         </div>
-                        <div className="flex items-center gap-2">
-                          <CheckCircle className="w-4 h-4 text-[#F27D26]" />
-                          <span className="text-xs text-white/40 font-mono tracking-wider">ZERO OVERHEAD</span>
-                        </div>
-                      </div>
-                    </div>
+                        <h2 className="text-2xl md:text-4xl font-serif italic text-white tracking-tight mb-4">
+                          Convert PYQ PDFs into interactive Mock Exams
+                        </h2>
+                        <p className="text-white/60 text-sm md:text-base leading-relaxed font-light mb-6">
+                          Upload your previous exam question papers, tests, or worksheets. Our AI parses and models complex multiple choice segments, delivering immediate feedback practice grids or strict timed test stimulators.
+                        </p>
 
-                    {/* Parser Up Box */}
-                    <div className="lg:col-span-2">
-                      <div 
-                        onDragEnter={handleDrag}
-                        onDragOver={handleDrag}
-                        onDragLeave={handleDrag}
-                        onDrop={handleDrop}
-                        className={`border rounded-2xl p-6 text-center transition-all flex flex-col items-center justify-center min-h-[220px] ${
-                          dragActive 
-                            ? "bg-[#F27D26]/10 border-[#F27D26]" 
-                            : "bg-white/5 border-white/10 hover:border-white/20"
-                        }`}
-                      >
-                        {isUploading ? (
-                          <div className="text-center">
-                            <div className="animate-spin rounded-full h-10 w-10 border-b-2 border-[#F27D26] mx-auto mb-4" />
-                            <p className="text-sm font-semibold mb-1 text-white font-mono">PARSING PDF DOCUMENT</p>
-                            <p className="text-xs text-white/40">{uploadProgressText}</p>
+                        <div className="flex gap-6">
+                          <div className="flex items-center gap-2">
+                            <CheckCircle className="w-4 h-4 text-[#F27D26]" />
+                            <span className="text-xs text-white/40 font-mono tracking-wider">100% SECURE TUNNEL</span>
                           </div>
-                        ) : (
-                          <>
-                            <div className="w-12 h-12 rounded-xl bg-white/5 text-[#F27D26] flex items-center justify-center mb-4 border border-white/10">
-                              <FileUp className="w-6 h-6" />
+                          <div className="flex items-center gap-2">
+                            <CheckCircle className="w-4 h-4 text-[#F27D26]" />
+                            <span className="text-xs text-white/40 font-mono tracking-wider">ZERO OVERHEAD</span>
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Parser Up Box */}
+                      <div className="lg:col-span-2">
+                        <div 
+                          onDragEnter={handleDrag}
+                          onDragOver={handleDrag}
+                          onDragLeave={handleDrag}
+                          onDrop={handleDrop}
+                          className={`border rounded-2xl p-6 text-center transition-all flex flex-col items-center justify-center min-h-[220px] ${
+                            dragActive 
+                              ? "bg-[#F27D26]/10 border-[#F27D26]" 
+                              : "bg-white/5 border-white/10 hover:border-white/20"
+                          }`}
+                        >
+                          {isUploading ? (
+                            <div className="text-center">
+                              <div className="animate-spin rounded-full h-10 w-10 border-b-2 border-[#F27D26] mx-auto mb-4" />
+                              <p className="text-sm font-semibold mb-1 text-white font-mono">PARSING PDF DOCUMENT</p>
+                              <p className="text-xs text-white/40">{uploadProgressText}</p>
                             </div>
-                            <h3 className="font-serif italic text-base text-white mb-1">
-                              Drag and Drop PYQ PDF
-                            </h3>
-                            <p className="text-xs text-white/40 mb-4 max-w-xs leading-relaxed font-light">
-                              Add standard examination files (up to 20MB)
+                          ) : (
+                            <>
+                              <div className="w-12 h-12 rounded-xl bg-white/5 text-[#F27D26] flex items-center justify-center mb-4 border border-white/10">
+                                <FileUp className="w-6 h-6" />
+                              </div>
+                              <h3 className="font-serif italic text-base text-white mb-1">
+                                Drag and Drop PYQ PDF
+                              </h3>
+                              <p className="text-xs text-white/40 mb-4 max-w-xs leading-relaxed font-light">
+                                Add standard examination files (up to 20MB)
+                              </p>
+                              
+                              <button
+                                onClick={() => fileInputRef.current?.click()}
+                                className="px-6 py-2 bg-white hover:bg-[#F27D26] text-black font-bold text-xs rounded-full cursor-pointer transition-colors duration-150 shadow-sm"
+                              >
+                                Browse Local Files
+                              </button>
+                              <input 
+                                type="file"
+                                ref={fileInputRef}
+                                onChange={handleFileChange}
+                                accept=".pdf"
+                                className="hidden"
+                              />
+                            </>
+                          )}
+                        </div>
+                      </div>
+
+                    </div>
+                  ) : (
+                    <div className="grid grid-cols-1 lg:grid-cols-5 gap-8 items-center relative z-10" id="google-drive-interface">
+                      
+                      {/* Left Informational Column */}
+                      <div className="lg:col-span-2">
+                        <div className="inline-flex items-center gap-1.5 px-3 py-1 bg-[#F27D26]/10 text-[#F27D26] rounded-full text-xs font-mono uppercase mb-4 border border-[#F27D26]/20">
+                          <Cloud className="w-3.5 h-3.5" />
+                          <span>Google Drive Sync</span>
+                        </div>
+                        <h2 className="text-2xl font-serif italic text-white tracking-tight mb-4">
+                          Connected Cloud Library
+                        </h2>
+                        
+                        {!driveToken ? (
+                          <>
+                            <p className="text-white/60 text-xs leading-relaxed font-light mb-6">
+                              Establish direct browser integration with your Google Drive. Natively browse PDFs and sync generated quizzes to Firestore instantly.
                             </p>
-                            
                             <button
-                              onClick={() => fileInputRef.current?.click()}
-                              className="px-6 py-2 bg-white hover:bg-[#F27D26] text-black font-bold text-xs rounded-full cursor-pointer transition-colors duration-150 shadow-sm"
+                              onClick={handleSignIn}
+                              className="px-5 py-2.5 bg-white text-black font-bold text-xs rounded-full cursor-pointer hover:bg-[#F27D26] hover:text-black transition duration-150"
                             >
-                              Browse Local Files
+                              Connect Google Drive
                             </button>
-                            <input 
-                              type="file"
-                              ref={fileInputRef}
-                              onChange={handleFileChange}
-                              accept=".pdf"
-                              className="hidden"
-                            />
                           </>
+                        ) : (
+                          <div className="space-y-4">
+                            <div className="bg-white/5 border border-white/5 rounded-2xl p-4">
+                              <p className="text-xs text-white/40 font-mono">ACCOUNT CLOUD LINK</p>
+                              <p className="text-sm font-bold text-white mt-1 truncate">
+                                {user?.displayName || user?.email || "Google Drive Connected"}
+                              </p>
+                              <div className="flex items-center gap-1.5 text-[10px] text-emerald-400 font-mono mt-1 font-bold uppercase">
+                                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                                <span>Active Bearer Wristband</span>
+                              </div>
+                            </div>
+                            <div className="text-xs text-white/55 leading-relaxed font-light">
+                              Your manual PDF uploads are automatically processed and duplicated inside the safe <span className="text-[#F27D26] font-mono">InstaMocks_PYQs</span> folder in your Google Drive.
+                            </div>
+                          </div>
                         )}
                       </div>
-                    </div>
 
-                  </div>
+                      {/* Right File Picker Column */}
+                      <div className="lg:col-span-3">
+                        {!driveToken ? (
+                          <div className="border border-dashed border-white/10 rounded-2xl p-8 text-center bg-white/5 min-h-[220px] flex flex-col items-center justify-center">
+                            <HardDrive className="w-10 h-10 text-white/20 mb-3" />
+                            <h4 className="font-serif italic text-sm text-white mb-1">Access Restrained</h4>
+                            <p className="text-xs text-white/40 max-w-xs scale-95 font-light leading-relaxed">
+                              Please click "Connect Google Drive" to fetch documents synchronously carrying temporary sandbox wristband.
+                            </p>
+                          </div>
+                        ) : (
+                          <div className="bg-white/5 border border-white/10 rounded-2xl p-5" id="drive-library-explorer">
+                            <div className="flex justify-between items-center gap-3 mb-4">
+                              <div className="relative flex-1">
+                                <Search className="w-3.5 h-3.5 text-white/40 absolute left-3 top-1/2 -translate-y-1/2" />
+                                <input
+                                  type="text"
+                                  value={driveSearch}
+                                  onChange={(e) => setDriveSearch(e.target.value)}
+                                  placeholder="Search Drive PDFs..."
+                                  className="w-full bg-white/5 border border-white/10 rounded-full pl-9 pr-4 py-1.5 text-xs text-white outline-none focus:border-[#F27D26] transition font-mono focus:bg-black/20"
+                                />
+                              </div>
+
+                              <button
+                                onClick={() => fetchDriveFiles(driveToken)}
+                                disabled={isFetchingDrive || isUploading}
+                                className="p-2 border border-white/10 hover:bg-white/5 text-white/60 hover:text-white rounded-full transition disabled:opacity-50 shrink-0 cursor-pointer"
+                                title="Refresh library"
+                              >
+                                <RefreshCw className={`w-3.5 h-3.5 ${isFetchingDrive ? "animate-spin text-[#F27D26]" : ""}`} />
+                              </button>
+                            </div>
+
+                            {isFetchingDrive ? (
+                              <div className="text-center py-12">
+                                <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-[#F27D26] mx-auto mb-3" />
+                                <p className="text-xs text-white/40 font-mono">RETRIEVING FILES FROM GOOGLE DRIVE...</p>
+                              </div>
+                            ) : isUploading ? (
+                              <div className="text-center py-12 bg-black/10 rounded-xl border border-white/5">
+                                <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-[#F27D26] mx-auto mb-3" />
+                                <p className="text-xs text-white font-mono font-medium tracking-tight">AI DOCUMENT PARSING PIPELINE IN PROCESS</p>
+                                <p className="text-[10px] text-white/55 mt-1 font-mono">{uploadProgressText}</p>
+                              </div>
+                            ) : filteredDriveFiles.length === 0 ? (
+                              <div className="text-center py-10 bg-white/5 border border-dashed border-white/10 rounded-xl">
+                                <FileText className="w-8 h-8 text-white/20 mx-auto mb-2" />
+                                <p className="text-white/60 text-xs font-medium">No PDF documents identified</p>
+                                <p className="text-white/30 text-[10px] mt-1 max-w-[240px] mx-auto leading-normal">
+                                  Try adjusting search triggers or upload new PDFs manually to save and sync them directly.
+                                </p>
+                              </div>
+                            ) : (
+                              <div className="space-y-2 max-h-[190px] overflow-y-auto pr-1">
+                                {filteredDriveFiles.map((f: any) => {
+                                  const sizeInMb = f.size ? (Number(f.size) / (1024 * 1024)).toFixed(1) + " MB" : "Unknown size";
+                                  const formattedTime = f.createdTime ? new Date(f.createdTime).toLocaleDateString() : "Unknown date";
+                                  
+                                  return (
+                                    <div
+                                      key={f.id}
+                                      className="bg-white/5 border border-white/5 rounded-xl p-3 flex justify-between items-center hover:border-white/15 transition group"
+                                    >
+                                      <div className="min-w-0 pr-4">
+                                        <p className="text-xs font-bold text-white truncate max-w-[180px] sm:max-w-xs group-hover:text-[#F27D26] transition font-sans" title={f.name}>
+                                          {f.name}
+                                        </p>
+                                        <div className="flex items-center gap-2 text-[9px] text-white/40 font-mono mt-0.5">
+                                          <span>{sizeInMb}</span>
+                                          <span>•</span>
+                                          <span>Created: {formattedTime}</span>
+                                        </div>
+                                      </div>
+
+                                      <button
+                                        disabled={isUploading}
+                                        onClick={() => processDriveFile(f.id, f.name)}
+                                        className="px-3 py-1 bg-white hover:bg-[#F27D26] text-black font-extrabold text-[10px] rounded-full cursor-pointer transition flex items-center gap-1.5 shrink-0"
+                                      >
+                                        <Sparkles className="w-2.5 h-2.5" />
+                                        <span>Parse</span>
+                                      </button>
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            )}
+                          </div>
+                        )}
+                      </div>
+
+                    </div>
+                  )}
+
                 </div>
               </div>
 
