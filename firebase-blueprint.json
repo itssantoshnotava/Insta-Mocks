@@ -1,0 +1,46 @@
+{
+  "entities": {
+    "Quiz": {
+      "title": "Quiz",
+      "description": "A parsed quiz structure containing questions generated from a PYQ PDF.",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string", "description": "The Firebase Authentication UID of the user who uploaded and generated this quiz." },
+        "title": { "type": "string", "description": "The title of the quiz." },
+        "questions": {
+          "type": "array",
+          "description": "Lists of quiz questions.",
+          "items": { "type": "object" }
+        },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Creation timestamp." }
+      },
+      "required": ["userId", "title", "questions", "createdAt"]
+    },
+    "Performance": {
+      "title": "Performance",
+      "description": "User's session score and performance parameters for a completed quiz.",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string", "description": "The Firebase Authentication UID of the user." },
+        "quizId": { "type": "string", "description": "Refers to the quiz document ID." },
+        "quizTitle": { "type": "string", "description": "Determines the cached title of the quiz." },
+        "score": { "type": "integer", "description": "The score obtained by the user." },
+        "totalQuestions": { "type": "integer", "description": "The total questions present in the quiz." },
+        "mode": { "type": "string", "enum": ["practice", "exam"], "description": "The test mode selected key." },
+        "timeTaken": { "type": "integer", "description": "Time elapsed in seconds during the session." },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Session timestamp." }
+      },
+      "required": ["userId", "quizId", "quizTitle", "score", "totalQuestions", "mode", "timeTaken", "createdAt"]
+    }
+  },
+  "firestore": {
+    "quizzes/{quizId}": {
+      "schema": "Quiz",
+      "description": "Collection of quizzes."
+    },
+    "performances/{performanceId}": {
+      "schema": "Performance",
+      "description": "Collection of historic performance records."
+    }
+  }
+}

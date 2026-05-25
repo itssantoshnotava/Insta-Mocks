@@ -1,0 +1,6 @@
+{
+  "name": "Insta Mocks",
+  "description": "Local PDF AI Quiz Generator. Manually upload Previous Year Question PDFs, process them using Gemini API, and practice with immediate feedback or in simulated Exam Mode.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
