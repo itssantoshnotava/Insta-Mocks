@@ -19,9 +19,12 @@ import {
   Video, 
   Info, 
   X, 
-  AlertTriangle 
+  AlertTriangle,
+  Key,
+  Settings
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
+import { GoogleGenAI, Type } from "@google/genai";
 
 // Preloaded Demo Quiz so unauthenticated or guest users can try out the portal immediately
 const COMPREHENSIVE_DEMO_QUIZ: Quiz = {
@@ -78,6 +81,9 @@ export default function App() {
   const [dragActive, setDragActive] = useState(false);
   const [errorAlert, setErrorAlert] = useState<string | null>(null);
   const [infoPopup, setInfoPopup] = useState(true);
+  const [userGeminiKey, setUserGeminiKey] = useState<string>(() => localStorage.getItem("user_gemini_key") || "");
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [showKeyWarning, setShowKeyWarning] = useState(false);
 
   // Dynamic lists from Firestore
   const [quizzes, setQuizzes] = useState<Quiz[]>([COMPREHENSIVE_DEMO_QUIZ]);
@@ -211,7 +217,7 @@ export default function App() {
     }
   };
 
-  // File Upload, Read As Data URL, and backend API transmission pipeline
+  // File Upload, Read As Data URL, and client-side AI processing pipeline
   const processFile = async (file: File) => {
     // Validate only PDFs
     if (file.type !== "application/pdf" && !file.name.endsWith(".pdf")) {
@@ -231,9 +237,16 @@ export default function App() {
       return;
     }
 
+    // State Check: Before processing request, check if the key exists.
+    const activeKey = localStorage.getItem("user_gemini_key");
+    if (!activeKey) {
+      setShowKeyWarning(true);
+      return;
+    }
+
     setErrorAlert(null);
     setIsUploading(true);
-    setUploadProgressText("Reading file from disk...");
+    setUploadProgressText("Reading file bytes natively in browser...");
 
     try {
       const reader = new FileReader();
@@ -241,48 +254,106 @@ export default function App() {
       // Promisified file reader loop
       const readPromise = new Promise<string>((resolve, reject) => {
         reader.onload = () => resolve(reader.result as string);
-        reader.onerror = () => reject(new Error("File conversion errored."));
+        reader.onerror = () => reject(new Error("Local file conversion failed."));
         reader.readAsDataURL(file);
       });
 
       const base64WithHeader = await readPromise;
-      setUploadProgressText("Structuring document & generating questions with gemini-2.5-flash...");
-
-      // Send to Express API endpoint (server proxies request to Gemini with secret API Key securely)
-      const response = await fetch("/api/generate-quiz", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          pdfBase64: base64WithHeader,
-          fileName: file.name
-        })
-      });
-
-      if (!response.ok) {
-        const errPayload = await response.json();
-        throw new Error(errPayload.error || "Server could not process PDF text properly.");
+      let cleanBase64 = base64WithHeader;
+      if (base64WithHeader.includes(";base64,")) {
+        cleanBase64 = base64WithHeader.split(";base64,")[1];
       }
 
-      const generatedQuizRes = await response.json();
+      setUploadProgressText("Analyzing PDF & generating quiz structure with gemini-2.5-flash...");
+
+      // Initialize the official @google/genai client on the client-side
+      const ai = new GoogleGenAI({ apiKey: activeKey });
+
+      // Structured Output Schema mapping
+      const responseSchema = {
+        type: Type.OBJECT,
+        properties: {
+          quiz_title: {
+            type: Type.STRING,
+            description: "A clear, descriptive title of the quiz extracted from the document header or content topic."
+          },
+          questions: {
+            type: Type.ARRAY,
+            description: "An array of standard multiple choice questions parsed from the document.",
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                id: {
+                  type: Type.STRING,
+                  description: "A unique short string or index identifier for this question (e.g., 'q1', 'q2')."
+                },
+                question_text: {
+                  type: Type.STRING,
+                  description: "The full text of the question. Extract the exact text cleanly without numbering prefix."
+                },
+                options: {
+                  type: Type.ARRAY,
+                  items: { type: Type.STRING },
+                  description: "Exactly 4 multiple choice options extracted from the question."
+                },
+                correct_option_index: {
+                  type: Type.INTEGER,
+                  description: "The zero-based index of the correct option (0 to 3)."
+                },
+                explanation: {
+                  type: Type.STRING,
+                  description: "A comprehensive, pedagogical step-by-step explanation detailing why the chosen option is correct."
+                }
+              },
+              required: ["id", "question_text", "options", "correct_option_index", "explanation"]
+            }
+          }
+        },
+        required: ["quiz_title", "questions"]
+      };
+
+      const promptText = `Analyze the uploaded PDF document (Previous Year Questions) and extract its contents into a fully-structured interactive quiz conforming exactly to the responseSchema format.
+Ensure all questions have exactly 4 multiple-choice options.
+Provide a descriptive title for this quiz based on the file name "${file.name}" or the document contents.
+Deduce the correct_option_index (0, 1, 2, or 3) logically.
+Write a supportive, elaborate, and pedagogical explanation for each answer.`;
+
+      const pdfPart = {
+        inlineData: {
+          mimeType: "application/pdf",
+          data: cleanBase64,
+        },
+      };
+
+      // Perform direct client-side model generation
+      const response = await ai.models.generateContent({
+        model: "gemini-2.5-flash",
+        contents: [pdfPart, promptText],
+        config: {
+          responseMimeType: "application/json",
+          responseSchema: responseSchema,
+        }
+      });
+
+      const resultText = response.text;
+      if (!resultText) {
+        throw new Error("Empty response returned from the Gemini model.");
+      }
+
+      const generatedQuizRes = JSON.parse(resultText);
       setUploadProgressText("Saving quiz to cloud Firestore...");
 
       // Write parsed quiz document to Firestore securely
       const quizId = "quiz-" + Date.now().toString() + "-" + Math.random().toString(36).substr(2, 5);
-      const newQuizData = {
-        userId: user.uid,
-        title: generatedQuizRes.quiz_title || file.name.replace(/\.[^/.]+$/, ""),
-        questions: generatedQuizRes.questions,
-        createdAt: new Date(), // Local fallback date
-      };
+      const newQuizTitle = generatedQuizRes.quiz_title || file.name.replace(/\.[^/.]+$/, "");
 
       try {
         const docRef = doc(db, "quizzes", quizId);
-        // Securely write using matching blueprint
         await setDoc(docRef, {
           userId: user.uid,
-          title: newQuizData.title,
-          questions: newQuizData.questions,
-          createdAt: serverTimestamp() // Firestore Server Timestamp
+          title: newQuizTitle,
+          questions: generatedQuizRes.questions,
+          createdAt: serverTimestamp()
         });
       } catch (fErr) {
         handleFirestoreError(fErr, OperationType.WRITE, `quizzes/${quizId}`);
@@ -293,8 +364,14 @@ export default function App() {
       setUploadProgressText("Quiz successfully created!");
 
     } catch (err: any) {
-      console.error("PDF Processing Pipeline Error:", err);
-      setErrorAlert(err.message || "An error occurred while generating the quiz schema.");
+      console.error("Client-Side PDF Processing Pipeline Error:", err);
+      let userFriendlyMsg = err.message || "An error occurred while generating the quiz schema.";
+      if (err.status === 401 || err.message?.includes("API key") || err.message?.includes("key is invalid")) {
+        userFriendlyMsg = "Invalid API Key. Please verify your Google AI Studio Gemini API Key prefix or structure in the settings config.";
+      } else if (err.status === 429) {
+        userFriendlyMsg = "Gemini API rate limit exceeded. Please try again in a few moments.";
+      }
+      setErrorAlert(userFriendlyMsg);
     } finally {
       setIsUploading(false);
     }
@@ -394,6 +471,16 @@ export default function App() {
           </div>
 
           <div className="flex items-center gap-3">
+            {/* Gemini API Key config button */}
+            <button
+              onClick={() => setIsSettingsOpen(true)}
+              className="inline-flex items-center gap-1.5 text-xs font-bold px-3.5 py-2 border border-white/10 hover:border-white/20 bg-[#F27D26]/10 text-[#F27D26] hover:bg-[#F27D26]/25 rounded-full cursor-pointer transition-colors duration-150 shadow-sm"
+              title="Gemini API Key Settings"
+            >
+              <Key className="w-3.5 h-3.5" />
+              <span>Gemini Key</span>
+            </button>
+
             {authLoading ? (
               <span className="text-xs text-white/40 font-mono">Syncing auth...</span>
             ) : user ? (
@@ -605,6 +692,145 @@ export default function App() {
         </AnimatePresence>
 
       </main>
+
+      {/* Settings Modal overlay */}
+      <AnimatePresence>
+        {isSettingsOpen && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center z-50 p-4"
+          >
+            <motion.div
+              initial={{ scale: 0.95, y: 15 }}
+              animate={{ scale: 1, y: 0 }}
+              exit={{ scale: 0.95, y: 15 }}
+              className="bg-[#0a0a0a] border border-white/10 rounded-3xl max-w-lg w-full p-6 md:p-8 shadow-2xl relative"
+            >
+              <button 
+                onClick={() => setIsSettingsOpen(false)}
+                className="absolute top-4 right-4 p-1.5 bg-white/5 hover:bg-white/10 rounded-full text-white/60 hover:text-white transition cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+
+              <div className="flex items-center gap-3 mb-4">
+                <div className="w-10 h-10 bg-[#F27D26]/10 text-[#F27D26] border border-[#F27D26]/20 rounded-xl flex items-center justify-center">
+                  <Key className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="text-xl font-serif italic text-white">Gemini Settings</h3>
+                  <p className="text-[10px] font-mono font-bold text-[#F27D26] tracking-wider uppercase">Browser-Side Key Storage</p>
+                </div>
+              </div>
+
+              <p className="text-white/60 text-xs md:text-sm leading-relaxed mb-6 font-light">
+                This applet processes all PDF documents directly on your machine. Your API Key is stored safely inside your browser's <code className="font-mono bg-white/5 px-1 py-0.5 rounded text-white/80">localStorage</code> and never transmitted to our servers or secondary backends.
+              </p>
+
+              <div className="space-y-4 mb-6">
+                <div>
+                  <label className="block text-xs uppercase font-mono font-bold tracking-wider text-white/40 mb-2">
+                    Google AI Studio Gemini API Key
+                  </label>
+                  <input
+                    type="password"
+                    value={userGeminiKey}
+                    onChange={(e) => setUserGeminiKey(e.target.value)}
+                    placeholder="AIzaSy..."
+                    className="font-mono bg-white/5 border border-white/10 rounded-xl px-4 py-3 text-white w-full text-sm outline-none focus:border-[#F27D26] focus:ring-1 focus:ring-[#F27D26] transition-all"
+                  />
+                </div>
+                
+                <div className="bg-amber-600/10 border border-amber-600/20 rounded-xl p-3 flex items-start gap-2.5 text-xs text-amber-200">
+                  <AlertTriangle className="w-4 h-4 text-amber-500 shrink-0 mt-0.5" />
+                  <p className="leading-relaxed font-light">
+                    <strong>Security Warning:</strong> High-risk keys should be handled with care. Ensure you are on a trustworthy system when entering API keys.
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex gap-3">
+                <button
+                  type="button"
+                  onClick={() => {
+                    localStorage.removeItem("user_gemini_key");
+                    setUserGeminiKey("");
+                    setIsSettingsOpen(false);
+                  }}
+                  className="flex-1 py-2.5 border border-white/10 text-white/60 hover:text-white/80 hover:bg-white/5 rounded-full text-xs font-bold font-sans transition cursor-pointer"
+                >
+                  Clear Key
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    localStorage.setItem("user_gemini_key", userGeminiKey.trim());
+                    setIsSettingsOpen(false);
+                  }}
+                  className="flex-1 py-2.5 bg-white text-black hover:bg-[#F27D26] hover:text-black font-bold rounded-full text-xs transition cursor-pointer"
+                >
+                  Save & Apply
+                </button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Warning Key Modal overlay */}
+      <AnimatePresence>
+        {showKeyWarning && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 bg-black/85 backdrop-blur-xs flex items-center justify-center z-50 p-4"
+          >
+            <motion.div
+              initial={{ scale: 0.95, y: 15 }}
+              animate={{ scale: 1, y: 0 }}
+              exit={{ scale: 0.95, y: 15 }}
+              className="bg-[#0a0a0a] border border-white/10 rounded-3xl max-w-md w-full p-6 text-center shadow-2xl relative"
+            >
+              <button 
+                onClick={() => setShowKeyWarning(false)}
+                className="absolute top-4 right-4 p-1.5 bg-white/5 hover:bg-white/10 rounded-full text-white/60 hover:text-white transition cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+
+              <div className="w-12 h-12 rounded-full bg-[#F27D26]/10 text-[#F27D26] flex items-center justify-center mb-4 mx-auto border border-[#F27D26]/20">
+                <Key className="w-6 h-6" />
+              </div>
+
+              <h3 className="text-xl font-serif italic text-white mb-2">Gemini API Key Required</h3>
+              <p className="text-white/60 text-xs md:text-sm mb-6 leading-relaxed font-light">
+                This portal processes PDF documents natively inside your browser. To extract questions and build mock exams, you must supply your personal Google AI Studio Gemini API Key.
+              </p>
+
+              <div className="flex flex-col gap-2.5">
+                <button
+                  onClick={() => {
+                    setShowKeyWarning(false);
+                    setIsSettingsOpen(true);
+                  }}
+                  className="w-full py-2.5 bg-[#F27D26] text-black font-bold rounded-full text-xs hover:bg-[#d0671c] transition cursor-pointer"
+                >
+                  Configure API Key Now
+                </button>
+                <button
+                  onClick={() => setShowKeyWarning(false)}
+                  className="w-full py-2.5 border border-white/10 hover:bg-white/5 text-white/80 rounded-full text-xs font-bold transition cursor-pointer"
+                >
+                  Dismiss
+                </button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       {/* Decorative footer */}
       <footer className="border-t border-white/5 bg-[#0a0a0a] py-6 px-6 mt-auto">
